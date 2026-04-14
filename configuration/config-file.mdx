@@ -1,0 +1,54 @@
+---
+title: "Configuring SNI-Spoofing: config.json field reference"
+description: "All SNI-Spoofing settings live in config.json. Learn what each field does, how to set FAKE_SNI, and how to change the listen or target port."
+---
+
+`config.json` is the single configuration file that controls every aspect of how SNI-Spoofing runs. It is loaded once when `main.py` starts, so all settings you change take effect only after you restart the process.
+
+## Default configuration
+
+The file ships with the following defaults:
+
+```json
+{
+  "LISTEN_HOST": "0.0.0.0",
+  "LISTEN_PORT": 40443,
+  "CONNECT_IP": "188.114.98.0",
+  "CONNECT_PORT": 443,
+  "FAKE_SNI": "auth.vercel.com"
+}
+```
+
+## Fields
+
+<ParamField body="LISTEN_HOST" type="string" default="0.0.0.0">
+  The IP address to bind the local proxy listener. The default `"0.0.0.0"` accepts connections on all network interfaces. Use `"127.0.0.1"` to restrict the proxy to local connections only.
+</ParamField>
+
+<ParamField body="LISTEN_PORT" type="integer" default="40443">
+  The local port the proxy listens on. Point your application or tunnel client at this port to route traffic through the proxy.
+</ParamField>
+
+<ParamField body="CONNECT_IP" type="string" required>
+  The IP address of the remote server you want to connect to. This is the destination the proxy forwards your traffic to after completing the DPI bypass handshake.
+</ParamField>
+
+<ParamField body="CONNECT_PORT" type="integer" default="443">
+  The port on the remote server. For HTTPS and TLS-based services this is almost always `443`.
+</ParamField>
+
+<ParamField body="FAKE_SNI" type="string" required>
+  The hostname to embed in the fake TLS ClientHello packet. DPI systems inspect this field to decide whether to allow the connection. Choose a domain your firewall permits — for example `"auth.vercel.com"` or `"www.google.com"`. The real server never sees this value.
+</ParamField>
+
+## Choosing a FAKE_SNI
+
+The hostname you put in `FAKE_SNI` only needs to be recognizable to the DPI system sitting between you and the remote server — it does not need to be reachable or to match the certificate on the remote server.
+
+- **Pick a domain that is allowed through your DPI or firewall.** Common choices are CDN endpoints and major cloud provider hostnames (e.g., Cloudflare, Vercel, Google, Akamai).
+- **The domain does not need to be reachable.** DPI reads the SNI from the fake packet and then drops that packet. The real server only ever receives the legitimate ClientHello that follows, which is not intercepted.
+- **Test a few candidates.** DPI rule sets differ between ISPs and regions. If one domain is blocked or inspected too aggressively, try another well-known CDN hostname.
+
+<Note>
+  `config.json` is read once at startup. After you edit any field, restart `main.py` for the changes to take effect.
+</Note>

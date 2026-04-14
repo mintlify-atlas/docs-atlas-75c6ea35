@@ -1,0 +1,80 @@
+---
+title: "SNI-Spoofing architecture: asyncio proxy and WinDivert"
+description: "Understand how SNI-Spoofing's components fit together: the asyncio proxy, WinDivert packet injector, and per-connection injection state machine."
+---
+
+SNI-Spoofing runs two concurrent execution contexts. The main thread drives an asyncio event loop that accepts incoming TCP connections and relays data bidirectionally between client and server. A background daemon thread runs a WinDivert receive loop that intercepts every matching outbound and inbound TCP packet at the kernel level, manipulating sequence numbers and injecting a fake TLS ClientHello before the OS TCP stack can process the real handshake.
+
+## Three main layers
+
+### 1. Listener — `main.py`
+
+The asyncio server binds to `LISTEN_HOST:LISTEN_PORT` and calls `loop.sock_accept()` in a loop. Each accepted connection spawns a `handle()` coroutine as an asyncio task. The listener also configures `SO_KEEPALIVE` on every accepted socket so idle connections are probed and reaped.
+
+```python
+mother_sock.bind((LISTEN_HOST, LISTEN_PORT))
+mother_sock.listen()
+loop = asyncio.get_running_loop()
+while True:
+    incoming_sock, addr = await loop.sock_accept(mother_sock)
+    asyncio.create_task(handle(incoming_sock, addr))
+```
+
+### 2. Packet injector — `fake_tcp.py` / `injecter.py`
+
+`TcpInjector` (injecter.py) is an abstract base class that opens a `WinDivert` handle and runs a blocking `recv` loop, dispatching each captured packet to the abstract `inject()` method.
+
+`FakeTcpInjector` (fake_tcp.py) implements `inject()`. It looks up the packet's 4-tuple in the shared `fake_injective_connections` dictionary and delegates to `on_outbound_packet()` or `on_inbound_packet()`. When the three-way handshake ACK is observed, it spawns a short-lived thread (`fake_send_thread`) that sleeps 1 ms and injects the fake ClientHello with a deliberately wrong TCP sequence number.
+
+The injector is started before the asyncio event loop:
+
+```python
+w_filter = (
+    "tcp and "
+    + "("
+    + "(ip.SrcAddr == " + INTERFACE_IPV4 + " and ip.DstAddr == " + CONNECT_IP + ")"
+    + " or "
+    + "(ip.SrcAddr == " + CONNECT_IP + " and ip.DstAddr == " + INTERFACE_IPV4 + ")"
+    + ")"
+)
+fake_tcp_injector = FakeTcpInjector(w_filter, fake_injective_connections)
+threading.Thread(target=fake_tcp_injector.run, args=(), daemon=True).start()
+asyncio.run(main())
+```
+
+### 3. Relay loop — `main.py relay_main_loop`
+
+After the injection phase succeeds, `handle()` creates two asyncio tasks — one for each direction — each running `relay_main_loop()`. The relay reads up to 65,575 bytes at a time from one socket and writes them to the other, continuing until EOF or any socket error.
+
+## Shared state: `fake_injective_connections`
+
+`fake_injective_connections` is a plain Python `dict[tuple, FakeInjectiveConnection]` keyed by the 4-tuple `(src_ip, src_port, dst_ip, dst_port)`. The asyncio loop inserts an entry before calling `sock_connect()` and removes it after the injection phase completes or fails. The WinDivert thread reads from this dict on every captured packet.
+
+Access to each `FakeInjectiveConnection` inside the WinDivert thread is protected by `connection.thread_lock` to prevent races with the timeout path in the asyncio coroutine.
+
+## Per-connection lifecycle
+
+<Steps>
+  <Step title="Connection accepted">
+    The asyncio listener accepts an incoming TCP connection. `handle()` builds a fake ClientHello via `ClientHelloMaker.get_client_hello_with()` using `os.urandom(32)` values for the random, session-ID, and key-share fields.
+  </Step>
+  <Step title="Outgoing socket created and registered">
+    A non-blocking outgoing socket is created, bound to `INTERFACE_IPV4`, and a `FakeInjectiveConnection` object is inserted into `fake_injective_connections` under the 4-tuple `(INTERFACE_IPV4, src_port, CONNECT_IP, CONNECT_PORT)`.
+  </Step>
+  <Step title="TCP three-way handshake — injection phase begins">
+    `loop.sock_connect()` initiates the TCP handshake. The WinDivert thread captures the outbound SYN, records `syn_seq`, and re-injects it unmodified. It then captures the inbound SYN-ACK, records `syn_ack_seq`, and re-injects it. Finally it captures the outbound ACK that completes the handshake.
+  </Step>
+  <Step title="Fake ClientHello injected">
+    On receiving the handshake ACK, `on_outbound_packet()` forwards the ACK and spawns `fake_send_thread`. That thread modifies the packet's payload to contain the fake ClientHello, sets the PSH flag, and writes a deliberately wrong `seq_num` (`syn_seq + 1 - len(fake_data)`) before calling `WinDivert.send()`.
+  </Step>
+  <Step title="Injection acknowledgement received">
+    The server acknowledges the fake ClientHello. `on_inbound_packet()` validates the ACK's sequence numbers and, if correct, sets `t2a_msg = "fake_data_ack_recv"` and signals `t2a_event` via `call_soon_threadsafe`.
+  </Step>
+  <Step title="Injection phase ends — relay phase begins">
+    The asyncio coroutine is unblocked by `t2a_event`. It removes the connection from `fake_injective_connections`, sets `monitor = False`, and creates two `relay_main_loop` tasks to forward data bidirectionally until EOF or error.
+  </Step>
+</Steps>
+
+<Note>
+  If `t2a_event` is not signalled within 2 seconds, `asyncio.wait_for` times out, `monitor` is set to `False`, and both sockets are closed. The WinDivert thread will subsequently forward any late packets unmodified because `connection.monitor` is `False`.
+</Note>

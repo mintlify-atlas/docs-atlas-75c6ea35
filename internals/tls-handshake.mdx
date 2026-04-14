@@ -1,0 +1,99 @@
+---
+title: "TLS ClientHello construction and fake SNI injection"
+description: "How SNI-Spoofing builds a valid TLS 1.3 ClientHello with a fake SNI hostname using ClientHelloMaker, and how the padding keeps packet length constant."
+---
+
+The fake ClientHello must be indistinguishable from legitimate TLS 1.3 traffic at the byte level. It needs a valid record structure, correct extension layout, and — critically — a fixed total size regardless of how long the fake SNI hostname is. A variable-length packet would make traffic fingerprinting trivial. `ClientHelloMaker` in `utils/packet_templates.py` solves both requirements: it assembles the message from a pre-validated template and uses a TLS padding extension (type `0x0015`) to keep the total size at exactly 517 bytes.
+
+## `ClientHelloMaker`
+
+The class holds a pre-built TLS 1.3 ClientHello template as a hex string. The template uses `"mci.ir"` as its placeholder SNI. Static byte ranges around the variable fields are extracted at class definition time so that `get_client_hello_with()` can assemble a new ClientHello with a single concatenation.
+
+### `get_client_hello_with()`
+
+```python
+@classmethod
+def get_client_hello_with(cls, rnd: bytes, sess_id: bytes, target_sni: bytes,
+                          key_share: bytes) -> bytes:  # rnd, sess_id, key_share: 32 bytes
+    server_name_ext = (
+        struct.pack("!H", len(target_sni) + 5)
+        + struct.pack("!H", len(target_sni) + 3)
+        + b"\x00"
+        + struct.pack("!H", len(target_sni))
+        + target_sni
+    )
+    padding_ext = struct.pack("!H", 219 - len(target_sni)) + (b"\x00" * (219 - len(target_sni)))
+    return (
+        cls.static1 + rnd + cls.static2 + sess_id
+        + cls.static3 + server_name_ext + cls.static4
+        + key_share + cls.static5 + padding_ext
+    )
+```
+
+The four variable fields and their byte positions in the original template are:
+
+| Field | Size | Template offset |
+|---|---|---|
+| `rnd` | 32 bytes | `[11:43)` |
+| `sess_id` | 32 bytes | `[44:76)` |
+| `key_share` | 32 bytes | `[262 + len(sni) : 294 + len(sni))` |
+| `target_sni` | variable | `[127 : 127 + len(sni))` |
+
+### Server name extension structure
+
+The SNI extension body (`server_name_ext`) follows the TLS wire format precisely:
+
+```
+[2 bytes] length of server_name_list  = len(target_sni) + 3 + 2  (i.e. len + 5)
+[2 bytes] length of server_name_list  = len(target_sni) + 3
+[1 byte]  name_type = 0x00 (host_name)
+[2 bytes] length of name              = len(target_sni)
+[N bytes] name bytes
+```
+
+### Padding extension (`0x0015`)
+
+The padding extension keeps the total packet size at 517 bytes regardless of the SNI length. The number of padding bytes is `219 - len(target_sni)`. The extension body is all zero bytes.
+
+```python
+padding_ext = struct.pack("!H", 219 - len(target_sni)) + (b"\x00" * (219 - len(target_sni)))
+```
+
+<Tip>
+  The template's SNI is `"mci.ir"` (6 bytes), so the default padding length is `219 - 6 = 213` bytes. If you use a shorter hostname the padding grows to compensate; if you use a longer one it shrinks.
+</Tip>
+
+## Random field generation in `main.py`
+
+When building the fake ClientHello for each new connection, all variable fields are populated with cryptographically random bytes:
+
+```python
+fake_data = ClientHelloMaker.get_client_hello_with(
+    os.urandom(32),   # rnd
+    os.urandom(32),   # sess_id
+    FAKE_SNI,         # target_sni (from config.json)
+    os.urandom(32),   # key_share
+)
+```
+
+Using `os.urandom(32)` for `rnd`, `sess_id`, and `key_share` ensures every connection produces a unique ClientHello, preventing replay detection. `FAKE_SNI` is loaded from `config.json` at startup as a byte string.
+
+## `ServerHelloMaker` (for completeness)
+
+`ServerHelloMaker` mirrors `ClientHelloMaker` for the server direction. It is used in testing and parsing flows to construct or validate a TLS 1.3 ServerHello with a known `rnd`, `sess_id`, and `key_share`. It is not involved in the packet injection path at runtime.
+
+```python
+@classmethod
+def get_server_hello_with(cls, rnd: bytes, sess_id: bytes, key_share: bytes, app_data1: bytes):
+    return (
+        cls.static1 + rnd + cls.static2 + sess_id
+        + cls.static3 + key_share
+        + cls.tls_change_cipher
+        + cls.tls_app_data_header
+        + struct.pack("!H", len(app_data1)) + app_data1
+    )
+```
+
+<Note>
+  The fake ClientHello is delivered to the network via `WinDivert.send()`, not through the outgoing socket. It bypasses the OS TCP stack entirely, which means the OS never sees the sequence number anomaly and does not interfere with or retransmit the injected segment.
+</Note>

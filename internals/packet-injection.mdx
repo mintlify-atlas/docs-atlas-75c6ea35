@@ -1,0 +1,128 @@
+---
+title: "TCP packet interception and injection with WinDivert"
+description: "How SNI-Spoofing uses WinDivert and pydivert to intercept TCP packets at the kernel level, manipulate sequence numbers, and inject the fake ClientHello."
+---
+
+WinDivert is a Windows kernel driver that lets user-space programs intercept, inspect, modify, and re-inject network packets before the OS delivers them to their destination. SNI-Spoofing relies on WinDivert because TLS ClientHello injection cannot be done through normal socket APIs: the fake packet must have a crafted TCP sequence number that the OS stack would otherwise reject or correct. By operating at the packet level, the injector can send data with any sequence number it chooses, allowing the remote server to receive and acknowledge the forged ClientHello as if it were a legitimate TCP segment.
+
+## `TcpInjector` base class — `injecter.py`
+
+`TcpInjector` is an abstract base class that manages the WinDivert handle and the packet receive loop.
+
+```python
+class TcpInjector(ABC):
+    def __init__(self, w_filter: str):
+        self.w: WinDivert = WinDivert(w_filter)
+
+    @abstractmethod
+    def inject(self, packet: Packet):
+        sys.exit("Not implemented")
+
+    def run(self):
+        with self.w:
+            while True:
+                packet = self.w.recv(65575)
+                self.inject(packet)
+```
+
+The WinDivert filter passed at construction time restricts packet capture to TCP traffic flowing between the local interface (`INTERFACE_IPV4`) and the remote server (`CONNECT_IP`):
+
+```python
+w_filter = (
+    "tcp and "
+    + "("
+    + "(ip.SrcAddr == " + INTERFACE_IPV4 + " and ip.DstAddr == " + CONNECT_IP + ")"
+    + " or "
+    + "(ip.SrcAddr == " + CONNECT_IP + " and ip.DstAddr == " + INTERFACE_IPV4 + ")"
+    + ")"
+)
+```
+
+`run()` is called on a daemon thread. It enters a `with self.w` context (which opens the WinDivert handle) and loops forever, blocking on `w.recv()` until a matching packet arrives, then passing it to `inject()`.
+
+## `FakeTcpInjector` — `fake_tcp.py`
+
+`FakeTcpInjector` extends `TcpInjector` and holds a reference to the shared `connections` dict. Its `inject()` method identifies the connection owner and dispatches to the appropriate direction handler.
+
+### Connection ID tuple
+
+Packets are looked up by a 4-tuple:
+
+```python
+# Inbound packet — src/dst are from the server's perspective
+c_id = (packet.ip.dst_addr, packet.tcp.dst_port,
+        packet.ip.src_addr, packet.tcp.src_port)
+
+# Outbound packet — src/dst are from the local socket's perspective
+c_id = (packet.ip.src_addr, packet.tcp.src_port,
+        packet.ip.dst_addr, packet.tcp.dst_port)
+```
+
+Both forms produce the same tuple `(src_ip, src_port, dst_ip, dst_port)` from the perspective of the outgoing socket, matching the key stored by the asyncio coroutine.
+
+### `on_outbound_packet()`
+
+Outbound packets are processed in order:
+
+1. **SYN** — Records `connection.syn_seq` and re-injects the packet unmodified.
+2. **ACK (handshake completion)** — Validates that `seq_num == syn_seq + 1` and `ack_num == syn_ack_seq + 1`. Forwards the ACK, sets `sch_fake_sent = True`, and spawns `fake_send_thread`.
+3. **Any other packet after `sch_fake_sent`** — Treated as unexpected; calls `on_unexpected_packet()`.
+
+### `on_inbound_packet()`
+
+Inbound packets are processed in order:
+
+1. **SYN-ACK** — Validates that `ack_num == syn_seq + 1`. Records `connection.syn_ack_seq` and re-injects unmodified.
+2. **ACK of fake data** — Seen after `fake_sent` is `True`. Validates `seq_num == syn_ack_seq + 1` and `ack_num == syn_seq + 1`. Signals the asyncio loop with `t2a_msg = "fake_data_ack_recv"`.
+3. **Any other packet** — Treated as unexpected.
+
+### `fake_send_thread()`
+
+This is the core injection routine. It runs on a short-lived daemon thread spawned after the handshake ACK is observed.
+
+```python
+def fake_send_thread(self, packet: Packet, connection: FakeInjectiveConnection):
+    time.sleep(0.001)
+    with connection.thread_lock:
+        if not connection.monitor:
+            return
+
+        packet.tcp.psh = True
+        packet.ip.packet_len = packet.ip.packet_len + len(connection.fake_data)
+        packet.tcp.payload = connection.fake_data
+        if packet.ipv4:
+            packet.ipv4.ident = (packet.ipv4.ident + 1) & 0xffff
+        if connection.bypass_method == "wrong_seq":
+            packet.tcp.seq_num = (connection.syn_seq + 1 - len(packet.tcp.payload)) & 0xffffffff
+            connection.fake_sent = True
+            self.w.send(packet, True)
+```
+
+Key steps:
+
+- **1 ms sleep** — Ensures the real ACK packet has already been delivered to the OS before the injected packet arrives, preventing race conditions with the TCP stack's acknowledgement tracking.
+- **PSH flag** — Signals to the server that this segment contains application data that should be passed to the application immediately.
+- **Payload replacement** — The ACK packet's payload is replaced with the full fake ClientHello bytes.
+- **Wrong sequence number** — `seq_num` is set to `syn_seq + 1 - len(fake_data)`, which is numerically lower than the expected next sequence number. This places the segment before the start of the server's valid receive window. The server's TCP stack, which validates sequence numbers strictly, discards the out-of-window segment without processing it. DPI systems that inspect all passing TCP segments regardless of window validity read the embedded SNI and allow the connection.
+- **`w.send(packet, True)`** — The `True` argument instructs WinDivert to recalculate checksums before injection.
+
+## `on_unexpected_packet()`
+
+When a packet does not match the expected handshake sequence, `on_unexpected_packet()` closes both sockets, sets `monitor = False`, and notifies the asyncio coroutine:
+
+```python
+def on_unexpected_packet(self, packet: Packet, connection: FakeInjectiveConnection, info_m: str):
+    print(info_m, packet)
+    connection.sock.close()
+    connection.peer_sock.close()
+    connection.monitor = False
+    connection.t2a_msg = "unexpected_close"
+    connection.running_loop.call_soon_threadsafe(connection.t2a_event.set)
+    self.w.send(packet, False)
+```
+
+`call_soon_threadsafe` is required because `t2a_event` lives in the asyncio event loop's thread. Calling `.set()` directly from the WinDivert thread would not be thread-safe.
+
+<Warning>
+  All packet manipulation inside the WinDivert thread acquires `connection.thread_lock` before accessing connection state. Skipping this lock when the asyncio coroutine sets `monitor = False` on timeout could cause a data race with `fake_send_thread`.
+</Warning>

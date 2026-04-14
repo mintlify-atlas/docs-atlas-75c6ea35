@@ -1,0 +1,312 @@
+---
+title: "SNI-Spoofing Python modules: classes and function reference"
+description: "Complete reference for all SNI-Spoofing Python modules: main.py, fake_tcp.py, injecter.py, monitor_connection.py, and the utils package."
+---
+
+SNI-Spoofing is organized into a small set of focused modules. `main.py` is the entry point: it loads configuration, resolves the outbound interface, and runs an asyncio proxy server alongside a background WinDivert injection thread. `fake_tcp.py` and `injecter.py` implement the packet-interception layer. `monitor_connection.py` tracks per-connection TCP state. The `utils/` package provides TLS packet-building helpers and network interface utilities. Each module has a single, well-scoped responsibility so you can audit or extend any layer independently.
+
+## main.py
+
+`main.py` reads `config.json`, resolves the outbound interface address, registers the `FakeTcpInjector` in a daemon thread, and runs the asyncio event loop that accepts TCP connections.
+
+### `get_exe_dir()`
+
+```python
+def get_exe_dir() -> str
+```
+
+Returns the directory that contains the running executable or script. When packaged with PyInstaller (`sys.frozen` is `True`), it returns the directory of the compiled `.exe` via `sys.executable`. Otherwise it returns the directory of `__file__`. This ensures `config.json` is always resolved next to the binary, regardless of the current working directory.
+
+### `relay_main_loop()`
+
+```python
+async def relay_main_loop(
+    sock_1: socket.socket,
+    sock_2: socket.socket,
+    peer_task: asyncio.Task,
+    first_prefix_data: bytes,
+) -> None
+```
+
+Bidirectional TCP relay coroutine. Reads up to 65 575 bytes at a time from `sock_1` and forwards each chunk to `sock_2`. If `first_prefix_data` is non-empty it is prepended to the first received chunk and then cleared. On any read, write, or EOF error both sockets are closed and `peer_task` is cancelled. Two instances of this coroutine run concurrently per connection — one in each direction.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `sock_1` | `socket.socket` | Source socket to read from. |
+| `sock_2` | `socket.socket` | Destination socket to write to. |
+| `peer_task` | `asyncio.Task` | The companion reverse-relay coroutine; cancelled on error. |
+| `first_prefix_data` | `bytes` | Optional bytes prepended to the first forwarded chunk. Pass `b""` to disable. |
+
+### `handle()`
+
+```python
+async def handle(
+    incoming_sock: socket.socket,
+    incoming_remote_addr: tuple,
+) -> None
+```
+
+Coroutine invoked for each accepted client connection. It:
+
+1. Builds a fake TLS ClientHello using `ClientHelloMaker.get_client_hello_with()` with `FAKE_SNI` from config.
+2. Creates a non-blocking outbound socket bound to `INTERFACE_IPV4` with TCP keepalive settings.
+3. Registers a `FakeInjectiveConnection` in the global `fake_injective_connections` dict so the WinDivert thread can intercept the handshake.
+4. Connects to `CONNECT_IP:CONNECT_PORT`.
+5. Waits up to 2 seconds for the WinDivert thread to signal `fake_data_ack_recv` via `t2a_event`.
+6. Deregisters the connection and starts two `relay_main_loop` tasks to shuttle data in both directions.
+
+### `main()`
+
+```python
+async def main() -> None
+```
+
+Asyncio server coroutine. Creates a TCP listening socket bound to `LISTEN_HOST:LISTEN_PORT` with `SO_REUSEADDR` and TCP keepalive enabled, then accepts connections in a loop and spawns a `handle()` task for each one.
+
+---
+
+## fake_tcp.py
+
+`fake_tcp.py` implements the core packet-level deception. It provides a data class for per-connection state and a concrete `TcpInjector` subclass that rewrites the TCP handshake to deliver a fake TLS ClientHello past DPI.
+
+### `FakeInjectiveConnection`
+
+Extends `MonitorConnection` with additional fields required by the fake-injection state machine.
+
+```python
+class FakeInjectiveConnection(MonitorConnection)
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `fake_data` | `bytes` | Pre-built TLS ClientHello carrying `FAKE_SNI`; injected at the wrong sequence number. |
+| `sch_fake_sent` | `bool` | Set to `True` once the ACK that triggers fake injection has been forwarded, preventing further outbound packets from being processed. |
+| `fake_sent` | `bool` | Set to `True` after `fake_send_thread` has called `w.send()` with the fake packet. |
+| `t2a_event` | `asyncio.Event` | Event set by the WinDivert thread to wake the asyncio `handle()` coroutine. |
+| `t2a_msg` | `str` | Message written before `t2a_event` is set; either `"fake_data_ack_recv"` or `"unexpected_close"`. |
+| `bypass_method` | `str` | Bypass strategy in use; currently only `"wrong_seq"` is implemented. |
+| `peer_sock` | `socket.socket` | The client-side socket; closed alongside `sock` on error. |
+| `running_loop` | `asyncio.AbstractEventLoop` | The event loop captured at construction time; used for thread-safe event dispatch via `call_soon_threadsafe`. |
+
+### `FakeTcpInjector`
+
+Concrete subclass of `TcpInjector`. Holds a reference to the global `fake_injective_connections` dict and processes every WinDivert-captured packet.
+
+```python
+class FakeTcpInjector(TcpInjector)
+```
+
+#### `fake_send_thread(packet, connection)`
+
+```python
+def fake_send_thread(
+    self,
+    packet: Packet,
+    connection: FakeInjectiveConnection,
+) -> None
+```
+
+Run in a daemon thread 1 ms after the three-way handshake ACK is forwarded. Under `connection.thread_lock` it mutates a copy of the ACK packet: sets the PSH flag, appends `connection.fake_data` as the payload, adjusts the IP packet length, increments the IPv4 identification field by 1, and — for the `"wrong_seq"` method — sets `seq_num` to `(syn_seq + 1 - len(fake_data)) & 0xffffffff` before calling `w.send()`. This positions the segment outside the server's receive window so the server discards it, while DPI systems that inspect all passing segments still read the embedded SNI.
+
+#### `on_inbound_packet(packet, connection)`
+
+```python
+def on_inbound_packet(
+    self,
+    packet: Packet,
+    connection: FakeInjectiveConnection,
+) -> None
+```
+
+Processes packets travelling from the remote server to the local host. Validates the SYN-ACK (checks that `ack_num == syn_seq + 1` and that the sequence number is consistent with any previously seen SYN-ACK), then passes it through. After `fake_sent` is `True`, accepts the pure ACK that acknowledges the fake data, sets `t2a_msg = "fake_data_ack_recv"`, and fires `t2a_event`. Any packet that does not match the expected state is forwarded to `on_unexpected_packet`.
+
+#### `on_outbound_packet(packet, connection)`
+
+```python
+def on_outbound_packet(
+    self,
+    packet: Packet,
+    connection: FakeInjectiveConnection,
+) -> None
+```
+
+Processes packets travelling from the local host to the remote server. Records `syn_seq` on the outbound SYN. On the outbound ACK completing the three-way handshake, validates sequence numbers, forwards the ACK, sets `sch_fake_sent = True`, and spawns `fake_send_thread` in a daemon thread. Rejects any further outbound packets after that point.
+
+#### `on_unexpected_packet(packet, connection, info_m)`
+
+```python
+def on_unexpected_packet(
+    self,
+    packet: Packet,
+    connection: FakeInjectiveConnection,
+    info_m: str,
+) -> None
+```
+
+Error handler for packets that violate the expected state machine. Prints `info_m` and the packet to stdout, closes both sockets, sets `monitor = False`, posts `t2a_msg = "unexpected_close"`, fires `t2a_event`, and re-injects the original packet without modification.
+
+#### `inject(packet)`
+
+```python
+def inject(self, packet: Packet) -> None
+```
+
+Main dispatch method called by `TcpInjector.run()` for every captured packet. Computes the connection ID tuple `(src_ip, src_port, dst_ip, dst_port)` — reversed for inbound packets — and looks it up in `self.connections`. Packets belonging to unknown connections are forwarded unchanged. Known connections are dispatched to `on_inbound_packet` or `on_outbound_packet` under `connection.thread_lock`.
+
+---
+
+## injecter.py
+
+`injecter.py` defines the abstract base class for all WinDivert-based TCP interceptors.
+
+### `TcpInjector`
+
+```python
+class TcpInjector(ABC)
+```
+
+Abstract base class. Accepts a WinDivert filter string and opens a `WinDivert` handle (`self.w`) in its constructor. Subclasses must implement `inject()`.
+
+#### `run()`
+
+```python
+def run(self) -> None
+```
+
+Blocking packet-capture loop. Opens the `WinDivert` handle as a context manager and calls `self.w.recv(65575)` in a tight loop, passing each captured `Packet` to `self.inject()`. This method is intended to run in a dedicated daemon thread.
+
+#### `inject(packet)` (abstract)
+
+```python
+@abstractmethod
+def inject(self, packet: Packet) -> None
+```
+
+Must be overridden by subclasses. Responsible for inspecting the packet, optionally mutating it, and re-injecting it via `self.w.send()`.
+
+---
+
+## monitor_connection.py
+
+`MonitorConnection` is a plain data container that holds the mutable TCP state tracked by the WinDivert thread for one connection.
+
+### `MonitorConnection`
+
+```python
+class MonitorConnection
+```
+
+| Field | Type | Initial value | Description |
+|---|---|---|---|
+| `monitor` | `bool` | `True` | When `False`, the WinDivert thread stops intercepting packets for this connection and forwards them unchanged. |
+| `syn_seq` | `int` | `-1` | Sequence number from the outbound SYN; `-1` until seen. |
+| `syn_ack_seq` | `int` | `-1` | Sequence number from the inbound SYN-ACK; `-1` until seen. |
+| `src_ip` | `str` | — | Local source IPv4 address. |
+| `dst_ip` | `str` | — | Remote destination IPv4 address. |
+| `src_port` | `int` | — | Ephemeral source port assigned by the OS. |
+| `dst_port` | `int` | — | Destination port (typically 443). |
+| `id` | `tuple` | `(src_ip, src_port, dst_ip, dst_port)` | Lookup key used in the `fake_injective_connections` dict. |
+| `thread_lock` | `threading.Lock` | new `Lock()` | Guards all field mutations shared between the WinDivert thread and the asyncio event loop. |
+| `sock` | `socket.socket` | — | The outbound socket for this connection. |
+
+---
+
+## utils/packet_templates.py
+
+`packet_templates.py` provides two class-method-based factories for constructing and parsing TLS handshake records. All methods are `@classmethod`, so no instantiation is needed.
+
+### `ClientHelloMaker`
+
+Builds and parses 517-byte TLS 1.3 ClientHello records. The class pre-computes static byte slices from a hardcoded template at import time; only the random bytes, session ID, SNI extension, and key share are variable per call.
+
+#### `get_client_hello_with(rnd, sess_id, target_sni, key_share)`
+
+```python
+@classmethod
+def get_client_hello_with(
+    cls,
+    rnd: bytes,        # 32 bytes
+    sess_id: bytes,    # 32 bytes
+    target_sni: bytes,
+    key_share: bytes,  # 32 bytes
+) -> bytes
+```
+
+Returns a complete ClientHello record. The SNI extension is packed according to RFC 6066 (a length-prefixed server name list), and the padding extension is adjusted so the total record length remains constant regardless of `target_sni` length.
+
+#### `parse_client_hello(client_hello_bytes)`
+
+```python
+@classmethod
+def parse_client_hello(cls, client_hello_bytes: bytes) -> tuple
+```
+
+Parses a 517-byte ClientHello produced by `get_client_hello_with()`. Asserts the total length, extracts `rnd`, `sess_id`, `tls_sni`, and `key_share`, and verifies round-trip consistency. Returns `(rnd, sess_id, tls_sni, key_share)`.
+
+#### `get_client_response_with(app_data1)`
+
+```python
+@classmethod
+def get_client_response_with(cls, app_data1: bytes) -> bytes
+```
+
+Returns a TLS ChangeCipherSpec record followed by a TLS ApplicationData record wrapping `app_data1`. Used to build the post-handshake client response.
+
+#### `parse_client_response(client_response_bytes)`
+
+```python
+@classmethod
+def parse_client_response(cls, client_response_bytes: bytes) -> bytes
+```
+
+Parses a client response built by `get_client_response_with()`. Asserts a minimum length of 32 bytes and returns the extracted `app_data1` payload.
+
+### `ServerHelloMaker`
+
+Builds and parses TLS ServerHello records using an analogous template-slice approach.
+
+#### `get_server_hello_with(rnd, sess_id, key_share, app_data1)`
+
+```python
+@classmethod
+def get_server_hello_with(
+    cls,
+    rnd: bytes,       # 32 bytes
+    sess_id: bytes,   # 32 bytes
+    key_share: bytes, # 32 bytes
+    app_data1: bytes,
+) -> bytes
+```
+
+Returns a complete ServerHello record followed by a TLS ChangeCipherSpec and an ApplicationData record carrying `app_data1`.
+
+#### `parse_server_hello(server_hello_bytes)`
+
+```python
+@classmethod
+def parse_server_hello(cls, server_hello_bytes: bytes) -> tuple
+```
+
+Parses a ServerHello of at least 159 bytes. Extracts `rnd`, `sess_id`, `key_share`, and `app_data1` and verifies round-trip consistency. Returns `(rnd, sess_id, key_share, app_data1)`.
+
+---
+
+## utils/network_tools.py
+
+`network_tools.py` provides two lightweight helpers for resolving the default outbound IP address without parsing routing tables or requiring external libraries.
+
+### `get_default_interface_ipv4()`
+
+```python
+def get_default_interface_ipv4(addr: str = "8.8.8.8") -> str
+```
+
+Opens a UDP socket and calls `connect()` against `addr` on port 53 — no data is sent. The OS selects the appropriate outbound interface, making the bound address available via `getsockname()`. Returns the local IPv4 address string, or an empty string on `OSError`. `main.py` passes `CONNECT_IP` instead of the default so the correct interface for the actual destination is selected.
+
+### `get_default_interface_ipv6()`
+
+```python
+def get_default_interface_ipv6(addr: str = "2001:4860:4860::8888") -> str
+```
+
+Identical to `get_default_interface_ipv4()` but uses an `AF_INET6` socket and an IPv6 target address. Returns the local IPv6 address string, or an empty string on `OSError`. Not currently used by `main.py` but available for future dual-stack support.

@@ -1,0 +1,67 @@
+---
+title: "DPI bypass methods: wrong_seq and future techniques"
+description: "SNI-Spoofing currently implements the wrong_seq bypass method, which confuses DPI by sending a fake ClientHello at an invalid TCP sequence number."
+---
+
+Bypass methods are the techniques SNI-Spoofing uses to trick Deep Packet Inspection (DPI) into reading a fake TLS ClientHello instead of the real one. DPI systems typically make allow/block decisions the moment they see a ClientHello — before the full TLS handshake completes. By manipulating TCP sequence numbers, SNI-Spoofing can deliver a packet that DPI processes eagerly while the real server ignores it entirely, because it falls outside the valid receive window.
+
+## wrong_seq
+
+The `wrong_seq` method is the active bypass technique in SNI-Spoofing. It exploits the fact that many DPI systems process TCP segments optimistically, without strictly validating sequence numbers against the established window.
+
+### How it works
+
+After the TCP three-way handshake completes (SYN → SYN-ACK → ACK), the proxy intercepts the outbound ACK and schedules a fake ClientHello to be sent immediately afterwards. The fake packet is given a sequence number that places it *before* the start of the valid data window:
+
+```python
+packet.tcp.seq_num = (connection.syn_seq + 1 - len(packet.tcp.payload)) & 0xffffffff
+```
+
+- `connection.syn_seq` is the sequence number from the original SYN packet.
+- Adding `1` advances past the SYN itself (standard TCP behavior).
+- Subtracting `len(packet.tcp.payload)` shifts the sequence number back by the length of the fake data, placing the segment before the window start.
+- The `& 0xffffffff` mask keeps the value within the 32-bit unsigned integer range and handles wraparound correctly.
+
+### What each side sees
+
+| Party | What happens |
+|---|---|
+| DPI system | Receives the fake ClientHello, reads `FAKE_SNI`, and decides to allow the connection |
+| Remote server | Receives an out-of-window segment and silently discards it, then waits for the in-window real ClientHello |
+
+Because DPI has already made its allow decision, the real ClientHello that follows is passed through without further inspection.
+
+### IPv4 identification field
+
+In addition to the modified sequence number, the IPv4 `ident` field is incremented on the fake packet to make it appear as a distinct datagram:
+
+```python
+packet.ipv4.ident = (packet.ipv4.ident + 1) & 0xffff
+```
+
+<Note>
+  There is a 1 ms delay (`time.sleep(0.001)`) between observing the outbound ACK and sending the fake packet. This small pause gives the ACK time to reach the remote server so the connection is fully established before the injected packet arrives.
+</Note>
+
+### Confirming the bypass completed
+
+After sending the fake packet, the proxy waits (up to 2 seconds) for the remote server to send back a plain ACK with no payload. Receiving that ACK confirms the server discarded the out-of-window fake segment and is ready to receive the real data stream. The proxy then hands the connection off to the bidirectional relay.
+
+<Tip>
+  DPI behaviour varies across networks and ISPs. On some networks `wrong_seq` works reliably; on others the DPI engine validates sequence numbers strictly and drops the fake packet before evaluating its SNI. If you are not getting through, try adjusting `FAKE_SNI` first — on a properly configured network, the sequence trick alone is usually sufficient.
+</Tip>
+
+## Future methods
+
+The source code contains a commented-out skeleton for a `wrong_checksum` bypass method:
+
+```python
+# if connection.bypass_method == "wrong_checksum":
+#     ...
+```
+
+The wrong-checksum approach works on a similar principle: some DPI systems do not validate TCP or IP checksums and will process a packet with a deliberately corrupted checksum. The real server, which does validate checksums, rejects the packet. This method is not yet implemented in SNI-Spoofing.
+
+<Info>
+  Whether a DPI system is fooled by an invalid checksum depends entirely on the hardware and software it runs on. Appliance-based DPI often offloads checksum validation to the NIC and never inspects bad-checksum packets at the application layer, making this technique ineffective in those environments.
+</Info>

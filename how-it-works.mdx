@@ -1,0 +1,57 @@
+---
+title: "How SNI-Spoofing bypasses Deep Packet Inspection (DPI)"
+description: "Learn how SNI-Spoofing uses wrong-sequence TCP injection and fake TLS ClientHello packets to confuse DPI systems and hide real traffic."
+---
+
+SNI-Spoofing defeats Deep Packet Inspection by exploiting a fundamental asymmetry between what a DPI middlebox sees and what the destination server actually accepts. During the TCP handshake, it injects a fake TLS ClientHello packet containing a harmless spoofed SNI hostname. Because the packet carries an intentionally wrong TCP sequence number, the DPI device reads the fake SNI and allows the connection — but the server silently discards the out-of-sequence packet. The real ClientHello from your application then arrives with the correct sequence number and is accepted by the server as normal.
+
+## The wrong-sequence bypass method
+
+The `wrong_seq` bypass method is the core technique used by SNI-Spoofing. After the TCP three-way handshake completes, the proxy calculates a deliberately invalid sequence number for the fake packet:
+
+```
+fake_seq = syn_seq + 1 - len(fake_data)
+```
+
+This value places the fake ClientHello's sequence number _before_ the start of the valid receive window. A stateful DPI device, which reconstructs the TCP byte stream in order to inspect application-layer content, sees the packet arrive and reads the SNI field it contains. The destination server, however, applies strict TCP sequence validation: because the sequence number falls outside the expected window, the server drops the packet without processing it.
+
+When your application subsequently sends the real ClientHello with the correct sequence number, the server processes it normally and the TLS handshake completes as expected. From the DPI's perspective, the connection was initiated to an allowed domain. From the server's perspective, the fake packet never existed.
+
+## WinDivert's role
+
+[WinDivert](https://reqrypt.org/windivert.html) is a Windows kernel driver that lets user-space programs intercept, modify, and re-inject network packets. SNI-Spoofing uses the `pydivert` Python binding to:
+
+- Install a packet filter targeting traffic between your local interface IP and the destination IP.
+- Capture each outbound SYN packet to learn the initial TCP sequence number.
+- Inject the fake ClientHello at the right moment — after the handshake completes but before the application sends data.
+- Monitor incoming ACKs to confirm the fake packet was acknowledged by the network path (and ignored by the server).
+
+Because WinDivert operates at the kernel level, it can insert packets into the network stack with arbitrary sequence numbers that would otherwise be impossible to send from a normal socket.
+
+## Connection flow
+
+<Steps>
+  <Step title="SYN — client initiates connection">
+    Your application connects to the SNI-Spoofing local proxy (default: `127.0.0.1:40443`). The proxy opens a raw outbound socket to the destination IP and port, and the OS sends a SYN packet. WinDivert captures this packet and records the initial TCP sequence number (`syn_seq`).
+  </Step>
+  <Step title="SYN-ACK — server responds">
+    The destination server replies with a SYN-ACK, acknowledging the connection. The OS automatically sends an ACK to complete the handshake.
+  </Step>
+  <Step title="ACK — three-way handshake complete">
+    The TCP connection is fully established. At this point the outbound sequence number is `syn_seq + 1`. WinDivert intercepts the first data window and prepares to inject the fake packet.
+  </Step>
+  <Step title="Fake ClientHello injection">
+    The proxy constructs a TLS ClientHello packet containing the spoofed SNI (e.g., `auth.vercel.com`) with a wrong sequence number (`syn_seq + 1 - len(fake_data)`). WinDivert injects this packet directly into the kernel network stack. The DPI device reads the SNI field and sees a connection to an allowed domain. The server receives the out-of-window packet and discards it.
+  </Step>
+  <Step title="Real ClientHello from your application">
+    The proxy relays the real TLS ClientHello from your application to the server with the correct sequence number. The server processes it, the TLS handshake completes normally, and encrypted data flows in both directions through the relay loop.
+  </Step>
+</Steps>
+
+## Fake SNI selection
+
+The spoofed SNI must resolve to a domain the DPI system considers acceptable — it does not need to be the actual destination. The default value, `auth.vercel.com`, is a publicly accessible domain that most networks allow. You can change `FAKE_SNI` in `config.json` to any domain that passes your network's DPI filter.
+
+<Note>
+  The fake SNI domain does not need to match the destination server. The server discards the fake packet entirely, so the domain only needs to be convincing to the DPI middlebox.
+</Note>

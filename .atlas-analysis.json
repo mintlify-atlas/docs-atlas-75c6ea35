@@ -1,0 +1,71 @@
+{
+  "projectType": "cli-tool",
+  "projectName": "SNI-Spoofing",
+  "projectDescription": "A Windows-based proxy tool that bypasses Deep Packet Inspection (DPI) by manipulating IP/TCP headers and injecting fake TLS ClientHello packets with a spoofed SNI to obscure the real destination from network censorship systems.",
+  "theme": "aspen",
+  "primaryColor": "#26a5e4",
+  "lightColor": "#6fc3ed",
+  "darkColor": "#4c4c4c",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "how-it-works",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "configuration/config-file",
+              "configuration/bypass-methods"
+            ]
+          },
+          {
+            "group": "Internals",
+            "pages": [
+              "internals/architecture",
+              "internals/packet-injection",
+              "internals/tls-handshake",
+              "internals/tcp-relay"
+            ]
+          },
+          {
+            "group": "Reference",
+            "pages": [
+              "reference/modules",
+              "reference/troubleshooting",
+              "reference/faq"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "DPI bypass via IP/TCP header manipulation",
+    "Fake TLS ClientHello injection with configurable SNI",
+    "Wrong sequence number bypass method to confuse DPI devices",
+    "Async TCP proxy relay using Python asyncio",
+    "WinDivert-based packet interception and injection",
+    "Configurable listen host/port and outbound destination",
+    "Automatic interface IPv4 detection"
+  ],
+  "publicApiSurface": [
+    "config.json — LISTEN_HOST, LISTEN_PORT, CONNECT_IP, CONNECT_PORT, FAKE_SNI",
+    "main.py — entry point, asyncio server loop",
+    "FakeInjectiveConnection — manages per-connection fake injection state",
+    "FakeTcpInjector — WinDivert-based injector with fake_send_thread, on_inbound_packet, on_outbound_packet",
+    "TcpInjector (abstract) — base class for packet injection loop",
+    "MonitorConnection — tracks TCP connection state (SYN seq, SYN-ACK seq, thread lock)",
+    "ClientHelloMaker.get_client_hello_with(rnd, sess_id, target_sni, key_share)",
+    "ClientHelloMaker.parse_client_hello(client_hello_bytes)",
+    "ServerHelloMaker.get_server_hello_with(rnd, sess_id, key_share, app_data1)",
+    "get_default_interface_ipv4(addr) — detects outbound IPv4 interface"
+  ]
+}

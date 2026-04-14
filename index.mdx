@@ -1,97 +1,66 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "SNI-Spoofing: Bypass DPI with IP/TCP Header Manipulation"
+description: "SNI-Spoofing is a Windows TCP proxy that defeats DPI by injecting fake TLS ClientHello packets with a spoofed SNI to hide your real destination."
 ---
 
-## Setting up
+SNI-Spoofing is an open-source tool for bypassing Deep Packet Inspection (DPI) on Windows. It acts as a local TCP proxy that intercepts your outgoing connections and injects fake TLS handshake packets with a spoofed Server Name Indication (SNI) field — confusing DPI devices into believing traffic is destined for an allowed host while your real data flows unimpeded.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="How it works" icon="network-wired" href="/how-it-works">
+    Understand the DPI bypass technique using wrong-sequence TCP injection
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Install dependencies and get SNI-Spoofing running in minutes
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Configuration" icon="gear" href="/configuration/config-file">
+    Customize the listen port, target IP, and fake SNI hostname
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="Internals" icon="microchip" href="/internals/architecture">
+    Explore the architecture: WinDivert, asyncio relay, and packet injection
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## What is SNI-Spoofing?
 
-Everything you need to create world-class documentation.
+Many network censorship systems (DPI firewalls) inspect the TLS ClientHello's SNI field to decide whether to allow or block a connection. SNI-Spoofing defeats this by injecting a fake ClientHello with an innocuous SNI (such as `auth.vercel.com`) at an intentionally wrong TCP sequence number. The DPI device reads and evaluates the fake packet, while the actual TLS handshake — arriving at the correct sequence — is accepted by the real server and ignored by the DPI.
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
+<CardGroup cols={2}>
+  <Card title="Packet injection" icon="syringe" href="/internals/packet-injection">
+    How WinDivert intercepts and rewrites outbound TCP packets
   </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
+  <Card title="TLS handshake spoofing" icon="shield-halved" href="/internals/tls-handshake">
+    ClientHello construction with a configurable fake SNI
   </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
+  <Card title="TCP relay" icon="arrows-left-right" href="/internals/tcp-relay">
+    Async bidirectional relay between client and remote server
   </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
+  <Card title="Troubleshooting" icon="wrench" href="/reference/troubleshooting">
+    Common errors, WinDivert setup, and connection debugging
   </Card>
-</Columns>
+</CardGroup>
 
-## Need inspiration?
+## Getting started
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+<Steps>
+  <Step title="Install Python and WinDivert">
+    SNI-Spoofing requires Python 3.10+ on Windows and the `pydivert` package, which wraps the WinDivert kernel driver for packet interception.
+  </Step>
+  <Step title="Install dependencies">
+    ```bash
+    pip install pydivert>=3.1.0
+    ```
+  </Step>
+  <Step title="Edit config.json">
+    Set `CONNECT_IP` to your target server, `CONNECT_PORT` to its port (typically 443), and `FAKE_SNI` to a publicly accessible hostname your DPI allows.
+  </Step>
+  <Step title="Run the proxy">
+    ```bash
+    python main.py
+    ```
+    Point your application at `127.0.0.1:40443` (or your configured `LISTEN_PORT`).
+  </Step>
+</Steps>
+
+<Note>
+  SNI-Spoofing must be run with administrator privileges on Windows so that WinDivert can install its kernel-level packet capture driver.
+</Note>

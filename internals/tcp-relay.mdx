@@ -1,0 +1,92 @@
+---
+title: "How SNI-Spoofing's asyncio bidirectional TCP relay works"
+description: "How SNI-Spoofing's asyncio relay loop forwards data between the local client and remote server after the fake-SNI injection phase completes."
+---
+
+After the fake injection phase succeeds, SNI-Spoofing acts as a transparent bidirectional proxy. The WinDivert thread stops monitoring the connection, and two asyncio tasks take over: one forwarding data from the incoming client socket to the outgoing server socket, and one in the reverse direction. From this point forward, all data flows through the normal OS TCP stack with no packet manipulation.
+
+## `relay_main_loop()`
+
+`relay_main_loop` in `main.py` is the coroutine that drives one direction of the relay.
+
+```python
+async def relay_main_loop(sock_1: socket.socket, sock_2: socket.socket, peer_task: asyncio.Task,
+                          first_prefix_data: bytes):
+    try:
+        loop = asyncio.get_running_loop()
+        while True:
+            try:
+                data = await loop.sock_recv(sock_1, 65575)
+                if not data:
+                    raise ValueError("eof")
+                if first_prefix_data:
+                    data = first_prefix_data + data
+                    first_prefix_data = b""
+                sent_len = await loop.sock_sendall(sock_2, data)
+                if sent_len != len(data):
+                    raise ValueError("incomplete send")
+            except Exception:
+                sock_1.close()
+                sock_2.close()
+                peer_task.cancel()
+                return
+    except Exception:
+        traceback.print_exc()
+        sys.exit("relay main loop error!")
+```
+
+Key behaviours:
+
+- **Read up to 65,575 bytes** — `loop.sock_recv(sock_1, 65575)` is non-blocking under asyncio. An empty return value signals EOF, which is treated as a normal termination by raising `ValueError("eof")`.
+- **`first_prefix_data`** — If set, the bytes are prepended to the first received chunk before forwarding. In the current implementation this is always `b""`, but the parameter exists to support early-data scenarios (for example, forwarding application data that arrived before the relay started).
+- **Error handling** — Any exception in the inner `try` block — including EOF, a broken pipe, or a cancelled send — closes both sockets and cancels the peer task. This ensures that when one direction terminates, the other is also torn down cleanly.
+
+## Two-task setup
+
+Both relay directions are created at the end of `handle()`:
+
+```python
+oti_task = asyncio.create_task(
+    relay_main_loop(outgoing_sock, incoming_sock, asyncio.current_task(), b""))
+await relay_main_loop(incoming_sock, outgoing_sock, oti_task, b"")
+```
+
+`oti_task` relays data from the outgoing (server) socket to the incoming (client) socket. The `await` on the second call relays data in the opposite direction on the current coroutine. Each task holds a reference to the other as `peer_task` so it can cancel it when its own direction closes.
+
+<Info>
+  `asyncio.current_task()` is passed as `peer_task` to `oti_task`. This means when the server-to-client direction finishes, it cancels the `handle()` coroutine itself, which is running the client-to-server relay.
+</Info>
+
+## Socket keepalive settings
+
+All sockets involved in relay — the listener socket, each accepted incoming socket, and each outgoing socket — are configured with TCP keepalive before the relay starts:
+
+```python
+outgoing_sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+outgoing_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 11)
+outgoing_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 2)
+outgoing_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+```
+
+| Option | Value | Meaning |
+|---|---|---|
+| `SO_KEEPALIVE` | `1` | Enable TCP keepalive probes |
+| `TCP_KEEPIDLE` | `11` s | Send first probe after 11 s of inactivity |
+| `TCP_KEEPINTVL` | `2` s | Interval between subsequent probes |
+| `TCP_KEEPCNT` | `3` | Drop connection after 3 unanswered probes |
+
+With these settings, a connection that goes silent is declared dead within approximately 11 + 3 × 2 = 17 seconds, limiting resource leaks from silently dropped connections.
+
+## Relay termination
+
+The relay continues until one of the following occurs:
+
+- `sock_recv` returns an empty bytes object (EOF — the remote end closed the connection cleanly).
+- Any socket operation raises an exception (e.g., connection reset, broken pipe).
+- The peer task is cancelled (because the other direction already terminated).
+
+In all cases, both sockets are closed and neither task is left running.
+
+<Warning>
+  Because both relay tasks share the same pair of sockets, closing `sock_1` and `sock_2` inside one task's exception handler will cause the peer task's next socket operation to raise an exception, which then closes the sockets a second time. Python's `socket.close()` is idempotent, so the double-close is harmless.
+</Warning>

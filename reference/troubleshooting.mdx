@@ -1,0 +1,97 @@
+---
+title: "Troubleshooting SNI-Spoofing: errors and connection fixes"
+description: "Fix common SNI-Spoofing issues: WinDivert driver load failures, administrator permission errors, connection timeouts, and unexpected packet state errors."
+---
+
+SNI-Spoofing can fail at three distinct layers: the Windows kernel driver (WinDivert), the TCP handshake injection state machine, and the Python runtime environment. When something goes wrong, the first place to look is stdout — `FakeTcpInjector` prints every unexpected packet event with a description and the raw packet object. The second signal is the 2-second connection timeout in `handle()`, which surfaces as a silent close on the client side. The sections below cover the most common failure modes and how to resolve each one.
+
+<AccordionGroup>
+
+  <Accordion title="WinDivert driver failed to load">
+    **Cause:** pydivert opens the WinDivert kernel driver when `TcpInjector.__init__` is called. This requires administrator privileges. Without them, the driver fails to initialize and the program exits immediately before accepting any connections.
+
+    **Fix:**
+
+    1. Right-click your terminal or shortcut and select **Run as administrator**.
+    2. Alternatively, open an elevated Command Prompt (search for `cmd`, right-click, **Run as administrator**) and run:
+
+    ```bash
+    python main.py
+    ```
+
+    If you built a PyInstaller EXE, right-click the `.exe` and choose **Run as administrator**, or set the executable's compatibility properties to always request elevation.
+  </Accordion>
+
+  <Accordion title="Connection times out after ~2 seconds">
+    **Cause:** `handle()` calls `asyncio.wait_for(fake_injective_conn.t2a_event.wait(), 2)`. If `t2a_event` is never set within 2 seconds, the connection is torn down silently. This means either the injected fake ClientHello never reached the server, or the server's acknowledging ACK never arrived back. Common sub-causes:
+
+    - `CONNECT_IP` in `config.json` is unreachable or blocked by a firewall.
+    - `FAKE_SNI` is not a domain that your network's DPI policy recognizes as permitted, so the connection is blocked anyway.
+    - The WinDivert filter string does not match the actual traffic (for example, because `get_default_interface_ipv4` resolved the wrong local IP).
+
+    **Fix:**
+
+    1. Verify that `CONNECT_IP` is reachable: `ping <CONNECT_IP>`.
+    2. Confirm that `FAKE_SNI` is a domain that your network's DPI permits — typically a well-known CDN or popular service domain.
+    3. Check that `get_default_interface_ipv4(CONNECT_IP)` returns the correct local IP. If you have multiple network adapters or an active VPN, the wrong interface may be selected.
+  </Accordion>
+
+  <Accordion title="unexpected inbound / unexpected outbound packet errors">
+    **Cause:** The TCP handshake did not progress through the exact sequence that `FakeTcpInjector` expects. When a packet fails a state-machine check, `on_unexpected_packet` prints the description and packet, sets `t2a_msg = "unexpected_close"`, and closes both sockets. Common causes include:
+
+    - A VPN or network driver modifies TCP sequence numbers or injects additional packets.
+    - The OS retransmits the SYN with a different sequence number before the handshake completes.
+    - A routing change causes traffic to take a different path mid-handshake.
+
+    **Fix:**
+
+    1. Read the printed message carefully — it specifies which check failed (for example, `"seq not matched"` or `"ack not matched"`).
+    2. Disable any VPN, tunnel adapter, or traffic-shaping software and retry.
+    3. Run `route print` and confirm that traffic to `CONNECT_IP` exits through the expected interface.
+    4. If OS retransmissions are the cause, reduce system load so the initial SYN completes before the retransmit timer fires.
+  </Accordion>
+
+  <Accordion title="No module named pydivert">
+    **Cause:** pydivert is not installed in the active Python environment.
+
+    **Fix:** Install it with pip:
+
+    ```bash
+    pip install pydivert>=3.1.0
+    ```
+
+    If the project ships a `requirements.txt`, install all dependencies at once:
+
+    ```bash
+    pip install -r requirements.txt
+    ```
+  </Accordion>
+
+  <Accordion title="pydivert on Linux or macOS">
+    **Cause:** pydivert is a Python binding for the WinDivert Windows kernel driver. WinDivert does not exist on Linux or macOS, and there is no cross-platform fallback in SNI-Spoofing.
+
+    **Fix:** Run SNI-Spoofing on a Windows host or inside a Windows virtual machine. There is no Linux or macOS support at this time.
+  </Accordion>
+
+  <Accordion title="config.json not found">
+    **Cause:** `get_exe_dir()` resolves the config path relative to the script or EXE location, not the shell's current working directory. If you invoke `python main.py` from a different directory, Python cannot find `config.json` and raises `FileNotFoundError` at startup.
+
+    **Fix:**
+
+    Run the script from the SNI-Spoofing directory:
+
+    ```bash
+    cd path\to\SNI-Spoofing
+    python main.py
+    ```
+
+    When running a PyInstaller EXE, `get_exe_dir()` automatically resolves to the EXE's location regardless of working directory — just make sure `config.json` is placed in the same directory as the EXE:
+
+    ```bash
+    pyinstaller --onefile main.py
+    # place config.json next to dist\main.exe
+    dist\main.exe
+    ```
+  </Accordion>
+
+</AccordionGroup>

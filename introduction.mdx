@@ -1,0 +1,43 @@
+---
+title: "SNI-Spoofing: Windows DPI Bypass Proxy via Fake TLS SNI"
+description: "SNI-Spoofing is a Windows TCP proxy that bypasses Deep Packet Inspection by injecting fake TLS ClientHello packets with a spoofed SNI to unblock traffic."
+---
+
+SNI-Spoofing is an open-source Windows TCP proxy that helps you reach blocked or censored services by defeating Deep Packet Inspection (DPI). It works by injecting a crafted fake TLS packet with a spoofed Server Name Indication (SNI) field before your real traffic arrives at the server — confusing the DPI middlebox while your actual connection goes through undetected. It is aimed at users and developers who need reliable, uncensored internet access in restricted network environments.
+
+## What is DPI and why does SNI matter?
+
+Deep Packet Inspection is a network filtering technique used by ISPs, governments, and firewalls to inspect the contents of TCP connections — not just their headers. When a TLS connection is established, the client sends a **ClientHello** message that contains the **Server Name Indication (SNI)**: the hostname the client wants to reach. This field is transmitted in plaintext, even in TLS 1.3, which means a DPI system can read it and block connections to specific domains.
+
+SNI-Spoofing exploits the difference between what the DPI device sees and what the destination server actually processes. By injecting a fake ClientHello with an innocuous SNI (such as `auth.vercel.com`) using a wrong TCP sequence number, the proxy tricks the DPI into thinking the connection is going to an allowed domain. The server ignores the fake packet and receives the real ClientHello as expected.
+
+## Key features
+
+<CardGroup cols={2}>
+  <Card title="Wrong-sequence injection" icon="shuffle">
+    Sends a fake TLS ClientHello with an incorrect TCP sequence number so DPI reads it but the destination server discards it.
+  </Card>
+  <Card title="Configurable fake SNI" icon="tag">
+    Set any publicly accessible domain as the spoofed SNI hostname — the default is `auth.vercel.com`.
+  </Card>
+  <Card title="Kernel-level interception" icon="cpu">
+    Uses WinDivert to intercept and manipulate packets at the Windows kernel network stack, below the application layer.
+  </Card>
+  <Card title="Async TCP proxy" icon="arrow-left-right">
+    Built on Python's asyncio for efficient, concurrent handling of multiple proxied connections.
+  </Card>
+  <Card title="Zero external routing" icon="house">
+    Listens on `127.0.0.1:40443` by default — point any app at it without changing system-wide network settings.
+  </Card>
+  <Card title="Single dependency" icon="package">
+    Requires only `pydivert>=3.1.0`, which also installs the WinDivert kernel driver automatically.
+  </Card>
+</CardGroup>
+
+## License and source
+
+SNI-Spoofing is released under the [GPL-3.0 license](https://github.com/patterniha/SNI-Spoofing/blob/main/LICENSE). Source code and releases are available on [GitHub](https://github.com/patterniha/SNI-Spoofing).
+
+<Note>
+  SNI-Spoofing uses WinDivert to intercept packets at the kernel level. You must run it with **administrator privileges** on Windows — a standard user account will not have sufficient permissions.
+</Note>
